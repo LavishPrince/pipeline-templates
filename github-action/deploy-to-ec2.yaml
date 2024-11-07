@@ -31,4 +31,3 @@ jobs:
           chmod 0400 server_key.pem
           ls
           scp -i 'server_key.pem'  -o StrictHostKeyChecking=no -r ./build/* root@64.227.143.116:/var/www/html/monstor/
-          ssh -i "server_key.pem" -o StrictHostKeyChecking=no root@64.227.143.116 "systemctl restart nginx"
