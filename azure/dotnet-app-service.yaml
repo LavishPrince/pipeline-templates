@@ -1,0 +1,39 @@
+trigger:
+  branches:
+    include:
+      - develop
+
+pool: "Agents"
+
+steps:
+  - script: |
+      cd path/to/api/
+      dotnet tool install --global dotnet-sonarscanner
+      unset version
+      dotnet sonarscanner begin /k:"project-key" /d:sonar.host.url="http://sonar" /d:sonar.qualitygate.wait=true /d:sonar.login=""
+      dotnet build
+      dotnet sonarscanner end /d:sonar.login=""
+      QUALITY_GATE_STATUS=$(curl -s -u "" "http://sonar/api/qualitygates/project_status?projectKey=" | jq -r '.projectStatus.status')
+      if [ "$QUALITY_GATE_STATUS" = "ERROR" ]; then
+        echo "Quality gate failed"
+        exit 1
+      fi
+    displayName: "SonarCube Check"
+
+  - script: |
+      cd /path/to/files
+      unset version
+      dotnet restore
+      ls && pwd
+      dotnet publish /p:Configuration=Release /p:Platform="Any CPU" -o out
+      cd out && zip -r deploy.zip .
+    displayName: "dotnet build"
+
+  - task: AzureRmWebAppDeployment@4
+    inputs:
+      ConnectionType: "AzureRM"
+      azureSubscription: "Subscription Name"
+      appType: "webAppLinux"
+      WebAppName: "app service name"
+      packageForLinux: "$(System.DefaultWorkingDirectory)/api/out/*.zip"
+      StartupCommand: "dotnet prod.dll"
