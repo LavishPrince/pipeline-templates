@@ -1,88 +1,124 @@
 # .github/workflows/ios-build.yml
-
-name: iOS Build
-
+name: iOS Build and Deploy
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-
+  workflow_dispatch:
 jobs:
-  ios-build:
-    name: Build iOS App
-    runs-on: macos-latest
+  ios-build-and-upload:
+    runs-on: macos-latest # Uses macOS runner with Xcode pre-installed
 
     steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "15.2"
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
+      # Set up Node.js 22
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: "16"
+          node-version: "22"
 
-      - name: Install yarn
-        run: npm install -g yarn
+      - name: Install Fastlane
+        run: |
+          brew install  --formulae fastlane cocoapods eza
 
-      - name: Install dependencies
-        run: yarn install
+      - name: Install npm dependencies
+        run: npm install
 
-      - name: Install Pods
-        working-directory: ios
-        run: pod install
-
-      - name: Set up Signing Credentials
+      - name: Set up provisioning profile
+        run: mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles && echo "$PROVISIONING_PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
         env:
-          XCODE_DEVELOPER_TEAM_ID: ${{ secrets.XCODE_DEVELOPER_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          IOS_DISTRIBUTION_CERT: ${{ secrets.IOS_DISTRIBUTION_CERT }}
-          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
-          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
-        run: |
-          echo "$IOS_DISTRIBUTION_CERT" | base64 --decode > ios_distribution.p12
-          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > ios_profile.mobileprovision
+          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
 
-          # Create a temporary keychain for signing
-          security create-keychain -p "" build.keychain
-          security import ios_distribution.p12 -k build.keychain -P "$IOS_CERT_PASSWORD" -A
+      - name: Set up certificate
+        run: |
+          echo "$CERTIFICATE_P12" | base64 --decode > certificate.p12
+          security create-keychain -p "github" build.keychain
+          security import certificate.p12 -k ~/Library/Keychains/build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -s ~/Library/Keychains/build.keychain
           security list-keychains -s build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          security unlock-keychain -p "github" build.keychain
+          security set-keychain-settings build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "github" build.keychain
+        env:
+          CERTIFICATE_P12: ${{ secrets.CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
 
-          # Move provisioning profile to the correct directory
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp ios_profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
-
-      - name: Build iOS
+      - name: Build iOS App
+        env:
+          TEAM_ID: ${{ secrets.GYM_EXPORT_TEAM_ID }}
+          CERT_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
         run: |
-          xcodebuild \
-            -workspace ios/YourApp.xcworkspace \
-            -scheme YourApp \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath ios/build \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM=$XCODE_DEVELOPER_TEAM_ID \
-            PROVISIONING_PROFILE_SPECIFIER="YourProvisioningProfileName"
+          cd ios
+          chmod -R 777 .
+          build_number=$(date +"%Y%m%d%H%M%S")
+          echo $build_number
+          plutil -create xml1 ExportOptions.plist
+          plutil -insert method -string "app-store-connect" ExportOptions.plist
+          plutil -insert compileBitcode -bool false ExportOptions.plist
+          plutil -insert uploadSymbols -bool false ExportOptions.plist
+          PROFILES_JSON="{"
+          PROFILES_JSON+="\"org.reactjs.native.example.IosGithubActionBuild\": \"app-store-profile-sample-github-actions\","
+          PROFILES_JSON+="}"
+          plutil -insert provisioningProfiles -json "$PROFILES_JSON" ExportOptions.plist
+          plutil -p ExportOptions.plist
 
-      - name: Archive Build Output
-        if: success()
-        uses: actions/upload-artifact@v3
-        with:
-          name: ios-build
-          path: ios/build/Build/Products/Release-iphoneos/
 
-      - name: Cleanup Keychain and Temporary Files
-        if: always() # Ensures cleanup runs even if the build fails
+          # cat ExportOptions.plist
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+          pod deintegrate || true
+          pod install --repo-update
+             
+          fastlane run update_project_team path:"./IosGithubActionBuild.xcodeproj" teamid:"$TEAM_ID"
+          fastlane run increment_build_number build_number:"$build_number"
+          fastlane run build_ios_app \
+            scheme:"IosGithubActionBuild" \
+            workspace:"IosGithubActionBuild.xcworkspace" \
+            export_method:"app-store" \
+            output_directory:"./build" \
+            output_name:"GenericBuild.ipa" \
+            include_symbols:"false" \
+            include_bitcode:"false" \
+            destination:"generic/platform=iOS" \
+            configuration:"Release" \
+            export_options:"ExportOptions.plist" \
+            clean:"true" \
+            suppress_xcode_output:"true" \
+            xcargs:"CODE_SIGN_IDENTITY='iPhone Distribution' CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER='app-store-profile-sample-github-actions'"
+            eza --tree build
+
+      - name: Ios App Upload
+
         run: |
-          # Delete the temporary keychain
+          cd ios
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY }}" | base64 --decode > api_key.p8
+          cat > fastlane/Fastfile << 'EOF'
+          default_platform(:ios)
+            platform :ios do
+                lane :beta do
+                  api_key = app_store_connect_api_key(
+                    key_id: "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}",
+                    issuer_id: "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}",
+                    key_filepath: "./api_key.p8"
+                  )
+
+                      upload_to_testflight(
+                        ipa: "./build/GenericBuild.ipa",
+                        api_key: api_key,
+                        skip_waiting_for_build_processing: true,
+                      )
+                end
+              end
+
+      - name: upload
+        run: cd ios && cat fastlane/Fastfile  && fastlane ios beta # fastlane ios beta
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remove the decrypted certificate and provisioning profile
+          rm -rf certificate.p12 profile.mobileprovision
+          rm -rf ios/api_key.p8
+          # Delete the keychain after the build process
           security delete-keychain build.keychain
-
-          # Remove temporary files with sensitive data
-          rm -f ios_distribution.p12
-          rm -f ios_profile.mobileprovision
